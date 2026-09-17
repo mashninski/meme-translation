@@ -25,6 +25,8 @@ MODELS = {"A": "gpt-5.6-luna", "B_editor": "gpt-5.6-terra", "C": "gpt-5.6-terra"
 RATES = {"gpt-5.6-luna": (0.20, 1.20), "gpt-5.6-terra": (2.00, 12.00), "gpt-5.6-sol": (4.00, 20.00)}
 D_RESULTS = OUTPUT / "terra-sol-results.json"
 D_HTML = OUTPUT / "terra-sol-comparison.html"
+E_RESULTS = OUTPUT / "terra-sol-conservative-results.json"
+E_HTML = OUTPUT / "terra-sol-conservative-comparison.html"
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 VISION_SCHEMA = {
@@ -45,9 +47,20 @@ EDITOR_SCHEMA = {
     "required": ["translation"],
     "additionalProperties": False,
 }
+CONSERVATIVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "final_translation": {"type": "string"},
+        "changed": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["final_translation", "changed", "reason"],
+    "additionalProperties": False,
+}
 VISION_PROMPT = """Рассмотри изображение как мем. Выбери только текст, который пользователь захотел бы заново разместить как содержание мема. Это смысловая, а не OCR-задача: не копируй весь видимый текст. Игнорируй бренды, логотипы, вывески в сцене, интерфейс, системные подписи и случайный фон, если они не несут шутку. У твита/поста выбирай текст по роли: если мемом служит добавленный комментарий, исходный текст поста игнорируй; если сам текст поста несёт мем, выбирай его. Сохраняй порядок отдельных сегментов в target_text. В ignored_text укажи замеченный, но отвергнутый текст, а в ignored_reason кратко объясни выбор. При сомнении между несколькими трактовками выставь ambiguous=true; не угадывай молча. Если содержательного текста нет, верни пустые target_text и translation. Переведи выбранный текст на естественный беларусский без русизмов, с правильными падежами, смыслом, шуткой и разговорным регистром. Не добавляй содержание и не переводи имена и бренды механически. Сохрани нормальную пунктуацию."""
 EDITOR_PROMPT = """Ты редактор беларусского перевода. Получаешь только выбранный исходный текст мема и черновой перевод. Проверь смысл, шутку, разговорный регистр, грамматику и отсутствие русизмов. Исправь лишь необходимое. Если всё хорошо, оставь текст без изменений. Не добавляй нового содержания. Если исходный текст пуст, верни пустой перевод. Сохрани обычную пунктуацию."""
 SOL_EDITOR_PROMPT = """Ты редактор беларусского перевода мема. Тебе переданы только уже выбранный исходный текст мема и черновой беларусский перевод. Изображения у тебя нет. Проверь соответствие смысла исходному тексту, русизмы, грамматику, естественность и разговорный регистр. Исправляй лишь необходимое; если перевод хорош, верни его без изменений. Не добавляй содержание, не меняй выбор текста и не пытайся заново распознавать изображение. Сохраняй обычную пунктуацию."""
+CONSERVATIVE_PROMPT = """Ты не создаёшь новый перевод, а проверяешь уже хороший беларусский перевод мема. У тебя есть только исходный выбранный текст и перевод Terra, изображения нет. Меняй текст только по конкретной причине: потерян или добавлен смысл; неверно переведено слово или конструкция; грамматическая или падежная ошибка; явный русизм; неестественная для беларусского языка конструкция; потерян важный оттенок оригинала. Если перевод корректный, верни его БЕЗ ИЗМЕНЕНИЙ. Не заменяй нормальное беларусское слово другим из стилистических предпочтений. Не делай текст литературнее или разговорнее оригинала. Сохраняй степень грубости, сленга и мата; не смягчай и не цензурируй мат и грубую лексику. Сохраняй мемный и разговорный регистр, но не добавляй сленг к нейтральному исходнику. Не исправляй нормальную беларусскую форму только потому, что есть другой допустимый вариант. Не меняй имена собственные и бренды без необходимости. Не меняй выбор target_text и не пытайся заново распознавать изображение. Если исправил, укажи короткую конкретную причину; если не исправил, reason должен быть пустой строкой, changed=false, а final_translation точной копией черновика."""
 
 
 def normalize(text: str) -> str:
@@ -110,6 +123,11 @@ def editor_body(target_text: list[str], draft: str) -> dict:
 def sol_editor_body(target_text: list[str], draft: str) -> dict:
     source = json.dumps({"target_text": target_text, "draft_translation": draft}, ensure_ascii=False)
     return request_body("gpt-5.6-sol", [{"type": "input_text", "text": source}], EDITOR_SCHEMA, "sol_edited_translation", SOL_EDITOR_PROMPT)
+
+
+def conservative_editor_body(target_text: list[str], draft: str) -> dict:
+    source = json.dumps({"target_text": target_text, "terra_translation": draft}, ensure_ascii=False)
+    return request_body("gpt-5.6-sol", [{"type": "input_text", "text": source}], CONSERVATIVE_SCHEMA, "conservative_translation_review", CONSERVATIVE_PROMPT)
 
 
 def call_api(key: str, body: dict) -> dict:
@@ -344,11 +362,112 @@ def review_saved_terra(key: str | None) -> int:
     return 0 if data["summary"]["completed_reviews"] == len(sources) else 1
 
 
+def validate_conservative(value: dict, draft: str) -> None:
+    if not isinstance(value, dict) or not isinstance(value.get("final_translation"), str) or not isinstance(value.get("changed"), bool) or not isinstance(value.get("reason"), str):
+        raise ValueError("Некорректные поля результата E")
+    if value["changed"] != (value["final_translation"] != draft):
+        raise ValueError("Поле changed не соответствует тексту перевода")
+    if value["changed"] != bool(value["reason"].strip()):
+        raise ValueError("Для правки нужна причина, без правки reason должен быть пустым")
+
+
+def conservative_summary(items: list[dict]) -> dict:
+    completed = [item for item in items if (item.get("conservative_record") or {}).get("raw_structured") and not item["conservative_record"].get("error")]
+    costs = [item["conservative_record"].get("cost", {}) for item in items if (item.get("conservative_record") or {}).get("usage")]
+    complete = len(completed) == len(items) and len(costs) == len(items) and all(x.get("complete") for x in costs)
+    return {
+        "completed_reviews": len(completed),
+        "changed_translations": sum(item["conservative_record"]["raw_structured"]["changed"] for item in completed),
+        "cost_complete": complete,
+        "total_review_cost_usd": sum(x["known_subtotal_usd"] for x in costs) if complete else None,
+        "known_subtotal_usd": sum(x.get("known_subtotal_usd") or 0 for x in costs),
+    }
+
+
+def render_conservative_comparison(items: list[dict]) -> str:
+    cards = []
+    for item in items:
+        record = item.get("conservative_record") or {}
+        value = record.get("raw_structured") or {}
+        edited = value.get("final_translation")
+        changed = value.get("changed") is True
+        amount = record.get("cost", {}).get("known_subtotal_usd")
+        price = f"${amount:.6f}" if amount is not None else "—"
+        image_src = "../test-input/" + urllib.request.pathname2url(item["filename"])
+        cards.append(f"<section class='card{' changed' if changed else ''}'><h2>{cell(item['filename'])}{' · ИЗМЕНЁН' if changed else ''}</h2><div class='layout'><img src='{html.escape(image_src, quote=True)}' alt='{cell(item['filename'])}'><div><p><b>target_text</b><br>{cell(item['target_text'])}</p><div class='triple'><div><h3>Terra</h3><p>{cell(item['terra_translation'])}</p></div><div><h3>Старый Sol-review</h3><p>{cell(item['old_sol_translation'])}</p></div><div class='new'><h3>Консервативный Sol-review</h3><p>{cell(edited)}</p></div></div><p><b>Изменил Terra:</b> {cell(value.get('changed'))} · <b>Причина:</b> {cell(value.get('reason'))}</p><p><b>Стоимость E:</b> {price} · <b>usage:</b> <code>{cell(json.dumps(record.get('usage'), ensure_ascii=False))}</code></p><p><b>Ошибка:</b> {cell(record.get('error'))}</p></div></div></section>")
+    summary = conservative_summary(items)
+    total = f"${summary['total_review_cost_usd']:.6f}" if summary["cost_complete"] else "неполная оценка"
+    return f"""<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Terra · старый Sol · консервативный Sol</title><style>body{{font:15px/1.45 system-ui,sans-serif;margin:24px;background:#f5f5f5;color:#222}}.card{{background:#fff;margin:20px 0;padding:18px;border-radius:10px;box-shadow:0 2px 8px #0001}}.card.changed{{border:3px solid #da8520}}.layout{{display:grid;grid-template-columns:minmax(220px,25%) 1fr;gap:18px}}img{{max-width:100%;max-height:560px;object-fit:contain;align-self:start}}.triple{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.triple>div{{background:#f7f9fc;padding:12px;border-radius:8px;min-width:0}}.changed .new{{background:#fff0ce}}.triple p{{white-space:pre-wrap;overflow-wrap:anywhere}}code{{overflow-wrap:anywhere}}@media(max-width:1100px){{.layout,.triple{{grid-template-columns:1fr}}}}</style><h1>Terra | старый Sol | консервативный Sol</h1><p>Проверено {summary['completed_reviews']} из {len(items)} · консервативный Sol изменил {summary['changed_translations']} переводов · стоимость E: {total}. Оранжевой рамкой отмечены отличия от Terra.</p>{''.join(cards)}</html>"""
+
+
+def save_conservative_results(data: dict) -> None:
+    OUTPUT.mkdir(exist_ok=True)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["summary"] = conservative_summary(data["images"])
+    temporary = E_RESULTS.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(E_RESULTS)
+    E_HTML.write_text(render_conservative_comparison(data["images"]), encoding="utf-8")
+
+
+def review_terra_conservatively(key: str | None) -> int:
+    original_path = OUTPUT / "results.json"
+    if not original_path.is_file() or not D_RESULTS.is_file():
+        print("Нужны сохранённые results.json и terra-sol-results.json.", file=sys.stderr)
+        return 2
+    original_bytes = original_path.read_bytes()
+    old_bytes = D_RESULTS.read_bytes()
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
+    old_hash = hashlib.sha256(old_bytes).hexdigest()
+    sources = terra_sources(json.loads(original_bytes))
+    old = json.loads(old_bytes)
+    if old.get("source_sha256") != original_hash or len(old.get("images", [])) != len(sources):
+        raise ValueError("Старый Sol-review не соответствует сохранённым результатам Terra")
+    for source, previous in zip(sources, old["images"]):
+        if previous.get("filename") != source["filename"] or previous.get("target_text") != source["target_text"] or previous.get("terra_translation") != source["terra_translation"]:
+            raise ValueError(f"Не совпадает исходный перевод: {source['filename']}")
+        old_record = previous.get("sol_record") or {}
+        if old_record.get("error") or not isinstance((old_record.get("raw_structured") or {}).get("translation"), str):
+            raise ValueError(f"Нет старого Sol-review: {source['filename']}")
+        source["old_sol_translation"] = old_record["raw_structured"]["translation"]
+    if E_RESULTS.exists():
+        data = json.loads(E_RESULTS.read_text(encoding="utf-8"))
+        if data.get("terra_source_sha256") != original_hash or data.get("old_sol_source_sha256") != old_hash:
+            raise ValueError("Исходные сохранённые результаты изменились после запуска E")
+    else:
+        data = {"terra_source_file": "results.json", "terra_source_sha256": original_hash, "old_sol_source_file": D_RESULTS.name, "old_sol_source_sha256": old_hash, "model": "gpt-5.6-sol", "pricing_usd_per_million_text_tokens": {"input": 4.00, "output": 20.00}, "images": [{**source, "conservative_record": None} for source in sources]}
+    pending = [item for item in data["images"] if not item.get("conservative_record") or item["conservative_record"].get("error")]
+    if pending and not key:
+        print("Для консервативного Sol-review нужен OPENAI_API_KEY.", file=sys.stderr)
+        return 2
+    save_conservative_results(data)
+    for index, item in enumerate(pending, 1):
+        print(f"Консервативный Sol-review [{index}/{len(pending)}] {item['filename']}", flush=True)
+        try:
+            record = run_call(key, conservative_editor_body(item["target_text"], item["terra_translation"]), False)
+            value = record.get("raw_structured")
+            if value is not None:
+                try:
+                    validate_conservative(value, item["terra_translation"])
+                except ValueError as error:
+                    record["error"] = str(error)
+            item["conservative_record"] = record
+        except Exception as error:
+            item["conservative_record"] = fail_record("gpt-5.6-sol", error)
+        save_conservative_results(data)
+    print(f"Сохранено: {E_HTML}")
+    print(json.dumps(data["summary"], ensure_ascii=False))
+    return 0 if data["summary"]["completed_reviews"] == len(sources) else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--render-only", action="store_true", help="Показать локальные изображения без вызовов API")
     parser.add_argument("--review-terra-with-sol", action="store_true", help="Выполнить только текстовый Sol-review сохранённых результатов C без повторного анализа изображений")
+    parser.add_argument("--review-terra-with-sol-conservative", action="store_true", help="Выполнить консервативный текстовый Sol-review сохранённых результатов C")
     args = parser.parse_args()
+    if args.review_terra_with_sol_conservative:
+        return review_terra_conservatively(load_key())
     if args.review_terra_with_sol:
         return review_saved_terra(load_key())
     if not INPUT.is_dir():

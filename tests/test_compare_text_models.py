@@ -54,6 +54,28 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(summary["completed_reviews"], 0)
         self.assertIsNone(summary["total_review_cost_usd"])
 
+    def test_conservative_review_uses_only_terra_text(self):
+        body = module.conservative_editor_body(["Hello"], "Вітаю")
+        self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual([part["type"] for part in body["input"][0]["content"]], ["input_text"])
+        self.assertNotIn("image_url", str(body))
+        self.assertNotIn("old_sol_translation", str(body))
+        self.assertIn("Вітаю", body["input"][0]["content"][0]["text"])
+
+    def test_conservative_change_requires_specific_reason(self):
+        with self.assertRaises(ValueError):
+            module.validate_conservative({"final_translation": "Вітаю!", "changed": True, "reason": ""}, "Вітаю")
+        with self.assertRaises(ValueError):
+            module.validate_conservative({"final_translation": "Вітаю", "changed": True, "reason": "Памылка"}, "Вітаю")
+        module.validate_conservative({"final_translation": "Вітаю", "changed": False, "reason": ""}, "Вітаю")
+
+    def test_conservative_partial_save_and_summary(self):
+        items = [{"filename": "x.jpg", "target_text": ["Hello"], "terra_translation": "Вітаю", "old_sol_translation": "Прывітанне", "conservative_record": None}]
+        summary = module.conservative_summary(items)
+        self.assertEqual(summary["completed_reviews"], 0)
+        self.assertIsNone(summary["total_review_cost_usd"])
+        self.assertIn("Старый Sol-review", module.render_conservative_comparison(items))
+
 
 if __name__ == "__main__":
     unittest.main()
