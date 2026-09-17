@@ -32,6 +32,28 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.validate_vision(value)
 
+    def test_sol_review_uses_only_saved_text(self):
+        body = module.sol_editor_body(["EVEN IN RUIN"], "Нават у руінах")
+        self.assertEqual(body["model"], "gpt-5.6-sol")
+        self.assertEqual([part["type"] for part in body["input"][0]["content"]], ["input_text"])
+        self.assertNotIn("image_url", str(body))
+        self.assertIn("EVEN IN RUIN", body["input"][0]["content"][0]["text"])
+
+    def test_sol_summary_counts_exact_translation_changes(self):
+        items = [
+            {"terra_translation": "Прывітанне!", "sol_record": {"raw_structured": {"translation": "Прывітанне!"}, "error": None, "usage": {"input_tokens": 10, "output_tokens": 10}, "cost": {"complete": True, "known_subtotal_usd": 0.00024}}},
+            {"terra_translation": "Як справы?", "sol_record": {"raw_structured": {"translation": "Як маешся?"}, "error": None, "usage": {"input_tokens": 10, "output_tokens": 10}, "cost": {"complete": True, "known_subtotal_usd": 0.00024}}},
+        ]
+        summary = module.sol_summary(items)
+        self.assertEqual(summary["completed_reviews"], 2)
+        self.assertEqual(summary["changed_translations"], 1)
+        self.assertAlmostEqual(summary["total_review_cost_usd"], 0.00048)
+
+    def test_sol_summary_accepts_pending_images(self):
+        summary = module.sol_summary([{"terra_translation": "Прывітанне", "sol_record": None}])
+        self.assertEqual(summary["completed_reviews"], 0)
+        self.assertIsNone(summary["total_review_cost_usd"])
+
 
 if __name__ == "__main__":
     unittest.main()

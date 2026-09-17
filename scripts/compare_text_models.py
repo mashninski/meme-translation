@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import json
 import mimetypes
@@ -21,7 +22,9 @@ INPUT = ROOT / "test-input"
 OUTPUT = ROOT / "test-output"
 API_URL = "https://api.openai.com/v1/responses"
 MODELS = {"A": "gpt-5.6-luna", "B_editor": "gpt-5.6-terra", "C": "gpt-5.6-terra"}
-RATES = {"gpt-5.6-luna": (0.20, 1.20), "gpt-5.6-terra": (2.00, 12.00)}
+RATES = {"gpt-5.6-luna": (0.20, 1.20), "gpt-5.6-terra": (2.00, 12.00), "gpt-5.6-sol": (4.00, 20.00)}
+D_RESULTS = OUTPUT / "terra-sol-results.json"
+D_HTML = OUTPUT / "terra-sol-comparison.html"
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 VISION_SCHEMA = {
@@ -44,6 +47,7 @@ EDITOR_SCHEMA = {
 }
 VISION_PROMPT = """Рассмотри изображение как мем. Выбери только текст, который пользователь захотел бы заново разместить как содержание мема. Это смысловая, а не OCR-задача: не копируй весь видимый текст. Игнорируй бренды, логотипы, вывески в сцене, интерфейс, системные подписи и случайный фон, если они не несут шутку. У твита/поста выбирай текст по роли: если мемом служит добавленный комментарий, исходный текст поста игнорируй; если сам текст поста несёт мем, выбирай его. Сохраняй порядок отдельных сегментов в target_text. В ignored_text укажи замеченный, но отвергнутый текст, а в ignored_reason кратко объясни выбор. При сомнении между несколькими трактовками выставь ambiguous=true; не угадывай молча. Если содержательного текста нет, верни пустые target_text и translation. Переведи выбранный текст на естественный беларусский без русизмов, с правильными падежами, смыслом, шуткой и разговорным регистром. Не добавляй содержание и не переводи имена и бренды механически. Сохрани нормальную пунктуацию."""
 EDITOR_PROMPT = """Ты редактор беларусского перевода. Получаешь только выбранный исходный текст мема и черновой перевод. Проверь смысл, шутку, разговорный регистр, грамматику и отсутствие русизмов. Исправь лишь необходимое. Если всё хорошо, оставь текст без изменений. Не добавляй нового содержания. Если исходный текст пуст, верни пустой перевод. Сохрани обычную пунктуацию."""
+SOL_EDITOR_PROMPT = """Ты редактор беларусского перевода мема. Тебе переданы только уже выбранный исходный текст мема и черновой беларусский перевод. Изображения у тебя нет. Проверь соответствие смысла исходному тексту, русизмы, грамматику, естественность и разговорный регистр. Исправляй лишь необходимое; если перевод хорош, верни его без изменений. Не добавляй содержание, не меняй выбор текста и не пытайся заново распознавать изображение. Сохраняй обычную пунктуацию."""
 
 
 def normalize(text: str) -> str:
@@ -101,6 +105,11 @@ def vision_body(model: str, path: Path) -> dict:
 def editor_body(target_text: list[str], draft: str) -> dict:
     source = json.dumps({"target_text": target_text, "draft_translation": draft}, ensure_ascii=False)
     return request_body(MODELS["B_editor"], [{"type": "input_text", "text": source}], EDITOR_SCHEMA, "edited_translation", EDITOR_PROMPT)
+
+
+def sol_editor_body(target_text: list[str], draft: str) -> dict:
+    source = json.dumps({"target_text": target_text, "draft_translation": draft}, ensure_ascii=False)
+    return request_body("gpt-5.6-sol", [{"type": "input_text", "text": source}], EDITOR_SCHEMA, "sol_edited_translation", SOL_EDITOR_PROMPT)
 
 
 def call_api(key: str, body: dict) -> dict:
@@ -247,10 +256,101 @@ def save(items: list[dict], key_missing: bool) -> None:
     (OUTPUT / "comparison.html").write_text(render(items, key_missing), encoding="utf-8")
 
 
+def terra_sources(data: dict) -> list[dict]:
+    """Взять только готовые результаты C из сохранённого первого эксперимента."""
+    images = data.get("images")
+    if not isinstance(images, list) or len(images) != 15:
+        raise ValueError("Ожидалось ровно 15 сохранённых изображений в results.json")
+    sources = []
+    for item in images:
+        record = item.get("variants", {}).get("C", {})
+        if record.get("error") or record.get("model") != "gpt-5.6-terra":
+            raise ValueError(f"Нет успешного результата Terra C: {item.get('filename')}")
+        value = validate_vision(record.get("raw_structured") or {})
+        sources.append({"filename": item["filename"], "target_text": value["target_text"], "terra_translation": value["translation"], "terra_usage": record.get("usage")})
+    return sources
+
+
+def sol_summary(items: list[dict]) -> dict:
+    completed = [item for item in items if (item.get("sol_record") or {}).get("raw_structured") and not item["sol_record"].get("error")]
+    costs = [item["sol_record"].get("cost", {}) for item in items if (item.get("sol_record") or {}).get("usage")]
+    complete = len(completed) == len(items) and len(costs) == len(items) and all(value.get("complete") for value in costs)
+    return {
+        "completed_reviews": len(completed),
+        "changed_translations": sum(item["terra_translation"] != item["sol_record"]["raw_structured"]["translation"] for item in completed),
+        "cost_complete": complete,
+        "total_review_cost_usd": sum(value["known_subtotal_usd"] for value in costs) if complete else None,
+        "known_subtotal_usd": sum(value.get("known_subtotal_usd") or 0 for value in costs),
+    }
+
+
+def render_sol_comparison(items: list[dict]) -> str:
+    cards = []
+    for item in items:
+        record = item.get("sol_record") or {}
+        edited = (record.get("raw_structured") or {}).get("translation")
+        changed = "да" if edited is not None and edited != item["terra_translation"] else "нет" if edited is not None else "—"
+        amount = record.get("cost", {}).get("known_subtotal_usd")
+        price = f"${amount:.6f}" if amount is not None else "—"
+        image_src = "../test-input/" + urllib.request.pathname2url(item["filename"])
+        cards.append(f"<section class='card'><h2>{cell(item['filename'])}</h2><div class='layout'><img src='{html.escape(image_src, quote=True)}' alt='{cell(item['filename'])}'><div><p><b>target_text</b><br>{cell(item['target_text'])}</p><div class='pair'><div><h3>C · Terra</h3><p>{cell(item['terra_translation'])}</p><small>normalized: {cell(normalize(item['terra_translation']))}</small></div><div><h3>D · Terra + Sol</h3><p>{cell(edited)}</p><small>normalized: {cell(normalize(edited or ''))}</small></div></div><p><b>Sol изменил перевод:</b> {changed} · <b>Стоимость Sol-review:</b> {price}</p><p><b>usage Sol:</b> <code>{cell(json.dumps(record.get('usage'), ensure_ascii=False))}</code></p><p><b>Ошибка:</b> {cell(record.get('error'))}</p></div></div></section>")
+    s = sol_summary(items)
+    total = f"${s['total_review_cost_usd']:.6f}" if s["cost_complete"] else "неполная оценка"
+    return f"""<!doctype html><html lang='ru'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Terra и Terra + Sol</title><style>body{{font:15px/1.45 system-ui,sans-serif;margin:24px;background:#f5f5f5;color:#222}}.card{{background:#fff;margin:20px 0;padding:18px;border-radius:10px;box-shadow:0 2px 8px #0001}}.layout{{display:grid;grid-template-columns:minmax(220px,32%) 1fr;gap:18px}}img{{max-width:100%;max-height:600px;object-fit:contain;align-self:start}}.pair{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.pair>div{{background:#f7f9fc;padding:12px;border-radius:8px;min-width:0}}.pair p{{white-space:pre-wrap;overflow-wrap:anywhere}}code{{overflow-wrap:anywhere}}small{{color:#555}}@media(max-width:850px){{.layout,.pair{{grid-template-columns:1fr}}}}</style><h1>Terra и текстовый review Sol</h1><p>Проверено {s['completed_reviews']} из {len(items)} · изменено переводов: {s['changed_translations']} · стоимость 15 Sol-review: {total}. Sol получал только текст из сохранённого результата Terra.</p>{''.join(cards)}</html>"""
+
+
+def save_sol_results(data: dict) -> None:
+    OUTPUT.mkdir(exist_ok=True)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    data["summary"] = sol_summary(data["images"])
+    temporary = D_RESULTS.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(D_RESULTS)
+    D_HTML.write_text(render_sol_comparison(data["images"]), encoding="utf-8")
+
+
+def review_saved_terra(key: str | None) -> int:
+    source_path = OUTPUT / "results.json"
+    if not source_path.is_file():
+        print("Не найден test-output/results.json с результатами Terra.", file=sys.stderr)
+        return 2
+    source_bytes = source_path.read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    sources = terra_sources(json.loads(source_bytes))
+    if D_RESULTS.exists():
+        data = json.loads(D_RESULTS.read_text(encoding="utf-8"))
+        if data.get("source_sha256") != source_hash or [x.get("filename") for x in data.get("images", [])] != [x["filename"] for x in sources]:
+            raise ValueError("Исходный results.json изменился после сохранения D; проверьте существующий terra-sol-results.json")
+    else:
+        data = {"source_file": "results.json", "source_sha256": source_hash, "model": "gpt-5.6-sol", "pricing_usd_per_million_text_tokens": {"input": 4.00, "output": 20.00}, "images": [{**source, "sol_record": None} for source in sources]}
+    pending = [item for item in data["images"] if not item.get("sol_record") or item["sol_record"].get("error")]
+    if pending and not key:
+        print("Для текстового Sol-review нужен OPENAI_API_KEY в окружении или локальном .env.", file=sys.stderr)
+        return 2
+    for index, item in enumerate(pending, 1):
+        print(f"Sol-review [{index}/{len(pending)}] {item['filename']}", flush=True)
+        try:
+            record = run_call(key, sol_editor_body(item["target_text"], item["terra_translation"]), False)
+            edited = record.get("raw_structured")
+            if edited is not None and not isinstance(edited.get("translation"), str):
+                record["error"] = "Некорректный перевод Sol"
+            item["sol_record"] = record
+        except Exception as error:
+            item["sol_record"] = fail_record("gpt-5.6-sol", error)
+        save_sol_results(data)
+    save_sol_results(data)
+    print(f"Сохранено: {D_HTML}")
+    print(json.dumps(data["summary"], ensure_ascii=False))
+    return 0 if data["summary"]["completed_reviews"] == len(sources) else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--render-only", action="store_true", help="Показать локальные изображения без вызовов API")
+    parser.add_argument("--review-terra-with-sol", action="store_true", help="Выполнить только текстовый Sol-review сохранённых результатов C без повторного анализа изображений")
     args = parser.parse_args()
+    if args.review_terra_with_sol:
+        return review_saved_terra(load_key())
     if not INPUT.is_dir():
         parser.error(f"Папка не найдена: {INPUT}")
     files = image_files()
